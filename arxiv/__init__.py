@@ -526,6 +526,7 @@ class Client(object):
 
     _last_request_dt: datetime
     _session: requests.Session
+    _headers=
 
     def __init__(self, page_size: int = 100, delay_seconds: float = 3.0, num_retries: int = 3):
         """
@@ -538,9 +539,11 @@ class Client(object):
         """
         self.page_size = page_size
         self.delay_seconds = delay_seconds
+        self.required_dt = timedelta(seconds=self.delay_seconds)
         self.num_retries = num_retries
         self._last_request_dt = None
         self._session = requests.Session()
+        self._session.headers = {"user-agent": "arxiv.py/2.1.3"}
 
     def __str__(self) -> str:
         # TODO: develop a more informative string representation.
@@ -621,59 +624,49 @@ class Client(object):
 
         If a request fails or is unexpectedly empty, retries the request up to
         `self.num_retries` times.
-        """
-        try:
-            return self.__try_parse_feed(url, first_page=first_page, try_index=_try_index)
-        except (
-            HTTPError,
-            UnexpectedEmptyPageError,
-            requests.exceptions.ConnectionError,
-        ) as err:
-            if _try_index < self.num_retries:
-                logger.debug("Got error (try %d): %s", _try_index, err)
-                return self._parse_feed(url, first_page=first_page, _try_index=_try_index + 1)
-            logger.debug("Giving up (try %d): %s", _try_index, err)
-            raise err
 
-    def __try_parse_feed(
-        self,
-        url: str,
-        first_page: bool,
-        try_index: int,
-    ) -> feedparser.FeedParserDict:
+        
         """
-        Recursive helper for _parse_feed. Enforces `self.delay_seconds`: if that
-        number of seconds has not passed since `_parse_feed` was last called,
+
+        for retry in range(self.num_retries):
+            self.__rate_limit()
+            logger.info("Requesting page (first: %r, try: %d): %s", first_page, retry, url)
+        
+            try:
+                resp = self._session.get(url)
+                if resp.status_code != requests.codes.OK:
+                    raise HTTPError(url, retry, resp.status_code)
+                feed = feedparser.parse(resp.content)
+                if first_page == 0 AND not feed.entries:
+                    raise UnexpectedEmptyPageError(url, retry, feed)
+                if feed.bozo:
+                    logger.warning(
+                        "Bozo feed; consider handling: %s", feed.get("bozo_exception")
+                    )
+                return feed
+                       
+            except (HTTPError, UnexpectedEmptyPageError, ConnectionError) as err:
+                if retry < self.num_retries - 1:
+                    logger.debug("Got error (try %d): %s", _try_index, err)
+                else:
+                    logger.debug("Giving up (try %d): %s", _try_index, err)
+                    raise err
+
+    def __rate_limit(self):
+        """
+        Enforces `self.delay_seconds`: if that
+        number of seconds has not passed since last request,
         sleeps until delay_seconds seconds have passed.
         """
-        # If this call would violate the rate limit, sleep until it doesn't.
-        if self._last_request_dt is not None:
-            required = timedelta(seconds=self.delay_seconds)
-            since_last_request = datetime.now() - self._last_request_dt
-            if since_last_request < required:
-                to_sleep = (required - since_last_request).total_seconds()
-                logger.info("Sleeping: %f seconds", to_sleep)
-                time.sleep(to_sleep)
-
-        logger.info("Requesting page (first: %r, try: %d): %s", first_page, try_index, url)
-
-        resp = self._session.get(url, headers={"user-agent": "arxiv.py/2.1.3"})
-        self._last_request_dt = datetime.now()
-        if resp.status_code != requests.codes.OK:
-            raise HTTPError(url, try_index, resp.status_code)
-
-        feed = feedparser.parse(resp.content)
-        if len(feed.entries) == 0 and not first_page:
-            raise UnexpectedEmptyPageError(url, try_index, feed)
-
-        if feed.bozo:
-            logger.warning(
-                "Bozo feed; consider handling: %s",
-                feed.bozo_exception if "bozo_exception" in feed else None,
-            )
-
-        return feed
-
+        if self._last_request_dt is None:
+            self._last_request_dt = datetime.now()
+            return
+        since_last_request = datetime.now() - self._last_request_dt
+        to_sleep = (self.required_delta - since_last_request).total_seconds()
+        
+        if since_last_request > self.required_delta:
+            logger.info("Sleeping: %f seconds", to_sleep)
+            time.sleep(to_sleep)
 
 class ArxivError(Exception):
     """This package's base Exception class."""
